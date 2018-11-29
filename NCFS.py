@@ -149,26 +149,26 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
             # calculate probability of correct classification
             p_correct = correct_assignments(p_reference, class_mat)
             # caclulate weight adjustments
-            # deltas = calculate_deltas(X, p_reference, p_correct, class_mat,
-            #                           self.coef_, self.reg, self.sigma, distance)
-            for l in range(X.shape[1]):
-                # values for feature l starting with sample 0 to N
-                feature_vec = X[:, l].reshape(-1, 1)
-                # distance in feature l for all samples, d_ij
-                # d_mat = np.pdist(feature_vec, )
-                # d_mat = distance_matrix(feature_vec, np.array([1]), distance)
-                d_mat = spatial.distance.pdist(feature_vec, metric=self.metric)
-                d_mat = spatial.distance.squareform(d_mat)
-                # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
-                d_mat *= p_reference
-                # calculate p_i * sum(D_ij), j from 0 to N
-                all_term = p_correct * d_mat.sum(axis=0)
-                # weighted in-class distances using adjacency matrix,
-                in_class_term = np.sum(d_mat*class_mat, axis=0)
-                sample_terms = all_term - in_class_term
-                # calculate delta following gradient ascent 
-                deltas[l] = 2 * self.coef_[l] \
-                            * ((1 / self.sigma) * sample_terms.sum() - self.reg)
+            deltas = calculate_deltas(X, p_reference, p_correct, class_mat,
+                                      self.coef_, self.reg, self.sigma, distance)
+            # for l in range(X.shape[1]):
+            #     # values for feature l starting with sample 0 to N
+            #     feature_vec = X[:, l].reshape(-1, 1)
+            #     # distance in feature l for all samples, d_ij
+            #     # d_mat = np.pdist(feature_vec, )
+            #     # d_mat = distance_matrix(feature_vec, np.array([1]), distance)
+            #     d_mat = spatial.distance.pdist(feature_vec, metric=self.metric)
+            #     d_mat = spatial.distance.squareform(d_mat)
+            #     # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
+            #     d_mat *= p_reference
+            #     # calculate p_i * sum(D_ij), j from 0 to N
+            #     all_term = p_correct * d_mat.sum(axis=0)
+            #     # weighted in-class distances using adjacency matrix,
+            #     in_class_term = np.sum(d_mat*class_mat, axis=0)
+            #     sample_terms = all_term - in_class_term
+            #     # calculate delta following gradient ascent 
+            #     deltas[l] = 2 * self.coef_[l] \
+            #                 * ((1 / self.sigma) * sample_terms.sum() - self.reg)
             # # calculate objective function
             new_objective = (np.sum(p_reference * class_mat) \
                           - self.reg * np.dot(self.coef_, self.coef_))
@@ -302,18 +302,14 @@ def reference_probabilities(X, weights, sigma, distance):
     return p_reference * scale_factors
 
 
-@jit(nopython=True)
+@jit(parallel=True)
 def calculate_deltas(X, p_reference, p_correct, class_matrix, weights, reg,
                      sigma, distance):
     deltas = np.zeros(X.shape[1])
     feature_vec = np.zeros((X.shape[0], 1))
     for l in range(X.shape[1]):
         # values for feature l starting with sample 0 to N
-        # feature_vec = X[:, l].reshape(-1, 1)
-        # feature_vec
-        # feature_vec = np.reshape(X[:, l], (X.shape[0], 1))
-        for i in range(feature_vec.shape[0]):
-            feature_vec[i] = X[i, l]
+        feature_vec = np.reshape(X[:, l], (X.shape[0], 1))
         # distance in feature l for all samples, d_ij
         d_mat = distance_matrix(feature_vec, np.array([1]), distance)
         # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
