@@ -11,6 +11,7 @@ Author : Dakota Hawkins
 import numpy as np
 from scipy import spatial
 from sklearn import base
+from numba import jit
 
 class NCFS(base.BaseEstimator, base.TransformerMixin): 
 
@@ -70,7 +71,7 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
         self.alpha = alpha
         self.sigma = sigma
         self.reg = reg
-        self.eta = eta 
+        self.eta = eta
         self.metric = metric
         self.coef_ = None
         self.score_ = None
@@ -119,6 +120,13 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
                              'Got {}.'.format(type(y)))
         if y.shape[0] != X.shape[0]:
             raise ValueError('`X` and `y` must have the same row numbers.')
+        if self.metric in ['cityblock', 'manhattan']:
+            distance = manhattan
+        elif self.metric == 'euclidean':
+            distance = euclidean
+        else:
+            raise ValueError('Unsupported distance metric: {}'.\
+                              format(self.metric))
         X= NCFS.__check_X(X)
         n_samples, n_features = X.shape
         # initialize all weights as 1
@@ -135,40 +143,20 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
                     class_mat[i, j] = 1
 
         past_objective, loss = 0, np.inf
-        diag_idx = np.diag_indices(n_samples, 2)
         while abs(loss) > self.eta:
-            # calculate D_w(x_i, x_j): w^2 * |x_i - x_j] for all i,j
-            distances = spatial.distance.pdist(X, metric=self.metric,
-                                               w=np.power(self.coef_, 2))
-            # organize as distance matrix
-            distances = spatial.distance.squareform(distances)
-            # calculate K(D_w(x_i, x_j)) for all i, j pairs
-            p_reference = np.exp(-1 * distances / self.sigma, dtype=np.float64)
-            # set p_ii = 0, can't select self in leave-one-out
-            p_reference[diag_idx] = 0
-
-            # add pseudocount if necessary to avoid dividing by zero
-            p_i = p_reference.sum(axis=0)
-            n_zeros = sum(p_i == 0)
-            if n_zeros > 0:
-                print('Adding pseudocounts to distance matrix to avoid ' +
-                      'dividing by zero.')
-                if n_zeros == len(p_i):
-                    pseudocount = np.exp(-20)
-                else:
-                    pseudocount = np.min(p_i)
-                p_i += pseudocount
-            scale_factors = 1 / (p_i)
-            p_reference = p_reference * scale_factors
-
+            p_reference = reference_probabilities(X, self.coef_, self.sigma,
+                                                  distance)
             # calculate probability of correct classification
-            p_correct = np.sum(p_reference * class_mat, axis=0)
-
+            p_correct = correct_assignments(p_reference, class_mat)
             # caclulate weight adjustments
-            for l in range(n_features):
+            # deltas = calculate_deltas(X, p_reference, p_correct, class_mat,
+            #                           self.coef_, self.reg, self.sigma, distance)
+            for l in range(X.shape[1]):
                 # values for feature l starting with sample 0 to N
                 feature_vec = X[:, l].reshape(-1, 1)
                 # distance in feature l for all samples, d_ij
+                # d_mat = np.pdist(feature_vec, )
+                # d_mat = distance_matrix(feature_vec, np.array([1]), distance)
                 d_mat = spatial.distance.pdist(feature_vec, metric=self.metric)
                 d_mat = spatial.distance.squareform(d_mat)
                 # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
@@ -180,12 +168,12 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
                 sample_terms = all_term - in_class_term
                 # calculate delta following gradient ascent 
                 deltas[l] = 2 * self.coef_[l] \
-                          * ((1 / self.sigma) * sample_terms.sum() - self.reg)
-                
-            # calculate objective function
+                            * ((1 / self.sigma) * sample_terms.sum() - self.reg)
+            # # calculate objective function
             new_objective = (np.sum(p_reference * class_mat) \
                           - self.reg * np.dot(self.coef_, self.coef_))
             # calculate loss from previous objective function
+            print(new_objective, past_objective)
             loss = new_objective - past_objective
             # update weights
             self.coef_ = self.coef_ + step_size * deltas
@@ -233,6 +221,112 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
         NCFS.__check_X(X)
         return X*self.coef_
 
+@jit(nopython=True, parallel=True)
+def manhattan(x, y, w):
+    value = 0
+    for i in range(x.shape[0]):
+        value += w[i] * np.abs(x[i] - y[i]) 
+    return value
+
+@jit(nopython=True, parallel=True)
+def euclidean(x, y, w):
+    value = 0
+    for i in range(x.shape[0]):
+        value += w[i] * (x[i] - y[i])**2
+    return np.sqrt(value)
+
+
+@jit(nopython=True, parallel=True)
+def distance_matrix(X, weights, distance):
+    dist_mat = np.zeros((X.shape[0], X.shape[0]))
+    for i in range(X.shape[0]):
+        for j in range(X.shape[0]):
+            dist_mat[i, j] = distance(X[i, :], X[j, :], weights)
+    return dist_mat
+
+@jit(nopython=True)
+def correct_assignments(p_reference, class_matrix):
+    """[summary]
+    
+    Parameters
+    ----------
+    p_reference : [type]
+        [description]
+    class_matrix : [type]
+        [description]
+    
+    Returns
+    -------
+    """
+    return np.sum(p_reference * class_matrix, axis=0)
+
+
+@jit(nopython=True)
+def reference_probabilities(X, weights, sigma, distance):
+    """
+    Calculate reference probability matrix.
+    
+    Parameters
+    ----------
+    X : [type]
+        [description]
+    weights : [type]
+        [description]
+    sigma : [type]
+        [description]
+    distance : callable
+        [description] (the default is 'cityblock', which [default_description])
+    
+    Returns
+    -------
+    [type]
+        [description]
+    """
+    # calculate D_w(x_i, x_j): w^2 * |x_i - x_j] for all i,j
+    distances = distance_matrix(X, weights, distance)
+    # calculate K(D_w(x_i, x_j)) for all i, j pairs
+    p_reference = np.exp(-1 * distances / sigma)
+    # set p_ii = 0, can't select self in leave-one-out
+    for i in range(p_reference.shape[0]):
+        p_reference[i, i] = 0
+    # add pseudocount if necessary to avoid dividing by zero
+    scale_factors = p_reference.sum(axis=0)
+    n_zeros = (scale_factors == 0).sum()
+    if n_zeros > 0:
+        if n_zeros == scale_factors.shape[0]:
+            pseudocount = np.exp(-20)
+        else:
+            pseudocount = np.min(scale_factors)
+        scale_factors += pseudocount
+    scale_factors = 1 / scale_factors
+    return p_reference * scale_factors
+
+
+@jit(nopython=True)
+def calculate_deltas(X, p_reference, p_correct, class_matrix, weights, reg,
+                     sigma, distance):
+    deltas = np.zeros(X.shape[1])
+    feature_vec = np.zeros((X.shape[0], 1))
+    for l in range(X.shape[1]):
+        # values for feature l starting with sample 0 to N
+        # feature_vec = X[:, l].reshape(-1, 1)
+        # feature_vec
+        # feature_vec = np.reshape(X[:, l], (X.shape[0], 1))
+        for i in range(feature_vec.shape[0]):
+            feature_vec[i] = X[i, l]
+        # distance in feature l for all samples, d_ij
+        d_mat = distance_matrix(feature_vec, np.array([1]), distance)
+        # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
+        d_mat *= p_reference
+        # calculate p_i * sum(D_ij), j from 0 to N
+        all_term = p_correct * d_mat.sum(axis=0)
+        # weighted in-class distances using adjacency matrix,
+        in_class_term = np.sum(d_mat*class_matrix, axis=0)
+        sample_terms = all_term - in_class_term
+        # calculate delta following gradient ascent 
+        deltas[l] = 2 * weights[l] \
+                    * ((1 / sigma) * sample_terms.sum() - reg)
+    return deltas
 
 def toy_dataset(n_features=1000):
     """
