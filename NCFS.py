@@ -121,9 +121,9 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
         if y.shape[0] != X.shape[0]:
             raise ValueError('`X` and `y` must have the same row numbers.')
         if self.metric in ['cityblock', 'manhattan']:
-            distance = manhattan
+            metric = 0
         elif self.metric == 'euclidean':
-            distance = euclidean
+            metric = 1
         else:
             raise ValueError('Unsupported distance metric: {}'.\
                               format(self.metric))
@@ -144,8 +144,8 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
 
         past_score, loss = 0, np.inf
         while abs(loss) > self.eta:
-            deltas, score = weight_adjustments(X, class_matrix, self.coef_,
-                                               self.sigma, self.reg, distance)
+            score = weight_adjustments(X, deltas, class_matrix, self.coef_,
+                                       self.sigma, self.reg, metric)
             # calculate loss from previous objective function
             print(score, past_score)
             loss = score - past_score
@@ -195,14 +195,14 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
         NCFS.__check_X(X)
         return X*self.coef_
 
-@jit(nopython=True, parallel=True)
+@jit('f8(f8[:,:],f8[:,:],f8[:])', nopython=True, parallel=True)
 def manhattan(x, y, w):
     value = 0
     for i in range(x.shape[0]):
         value += w[i] * np.abs(x[i] - y[i]) 
     return value
 
-@jit(nopython=True, parallel=True)
+@jit('f8(f8[:,:],f8[:,:],f8[:])', nopython=True, parallel=True)
 def euclidean(x, y, w):
     value = 0
     for i in range(x.shape[0]):
@@ -210,12 +210,15 @@ def euclidean(x, y, w):
     return np.sqrt(value)
 
 
-@jit(nopython=True, parallel=True)
-def distance_matrix(X, weights, distance):
-    dist_mat = np.zeros((X.shape[0], X.shape[0]))
+@jit('f8[:,:](f8[:,:], f8[:], i8)', nopython=True, parallel=True)
+def distance_matrix(X, weights, metric):
+    dist_mat = np.zeros((X.shape[0], X.shape[0]), dtype=np.float64)
     for i in range(X.shape[0]):
         for j in range(X.shape[0]):
-            dist_mat[i, j] = distance(X[i, :], X[j, :], weights)
+            if metric == 0:
+                dist_mat[i, j] = manhattan(X[i, :], X[j, :], weights)
+            else:
+                dist_mat[i, j] = euclidean(X[i, :], X[j, :], weights)
     return dist_mat
 
 @jit(nopython=True)
@@ -235,9 +238,9 @@ def correct_assignments(p_reference, class_matrix):
     return np.sum(p_reference * class_matrix, axis=0)
 
 
-@jit(nopython=True)
-def weight_adjustments(X, class_matrix, feature_weights, sigma,
-                       reg, distance):
+@jit('f8(f8[:,:], f8[:], f8[:,:], f8[:], f8, f8, i8)', nopython=True)
+def weight_adjustments(X, deltas, class_matrix, feature_weights, sigma,
+                       reg, metric):
     """
     Calculate reference probability matrix.
     
@@ -257,10 +260,9 @@ def weight_adjustments(X, class_matrix, feature_weights, sigma,
     [type]
         [description]
     """
-    deltas = np.zeros(X.shape[1])
     sample_weights = np.ones(X.shape[0])
     # calculate D_w(x_i, x_j): w^2 * |x_i - x_j] for all i,j
-    distances = distance_matrix(X, feature_weights, distance)
+    distances = distance_matrix(X, feature_weights, metric)
     # calculate K(D_w(x_i, x_j)) for all i, j pairs
     p_reference = np.exp(-1 * distances / sigma)
     # set p_ii = 0, can't select self in leave-one-out
@@ -283,7 +285,7 @@ def weight_adjustments(X, class_matrix, feature_weights, sigma,
         # values for feature l starting with sample 0 to N
         feature_vec = np.expand_dims(X[:, l], 1)
         # distance in feature l for all samples, d_ij
-        d_mat = distance_matrix(feature_vec, sample_weights, distance)
+        d_mat = distance_matrix(feature_vec, sample_weights, metric)
         # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
         d_mat = d_mat * p_reference
         # calculate p_i * sum(D_ij), j from 0 to N
@@ -295,9 +297,11 @@ def weight_adjustments(X, class_matrix, feature_weights, sigma,
         deltas[l] = 2 * feature_weights[l] \
                   * ((1 / sigma) * sample_terms.sum() - reg)
     score = (np.sum(p_reference * class_matrix) \
-          - reg * np.dot(feature_weights, feature_weights))
-    return deltas, score
+          - reg * np.sum(feature_weights * feature_weights))
+    return score
 
+# @jit(nopython=True)
+# def calculate_delta()
 
 @jit()
 def calculate_deltas(X, p_reference, p_correct, class_matrix, weights, reg,
