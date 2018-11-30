@@ -136,54 +136,28 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
         # get initial step size
         step_size = self.alpha 
         # construct adjacency matrix of class membership for matrix mult. 
-        class_mat = np.zeros((n_samples, n_samples), np.float64)
+        class_matrix = np.zeros((n_samples, n_samples), np.float64)
         for i in range(n_samples):
             for j in range(n_samples):
                 if y[i] == y[j]:
-                    class_mat[i, j] = 1
+                    class_matrix[i, j] = 1
 
-        past_objective, loss = 0, np.inf
+        past_score, loss = 0, np.inf
         while abs(loss) > self.eta:
-            p_reference = reference_probabilities(X, self.coef_, self.sigma,
-                                                  distance)
-            # calculate probability of correct classification
-            p_correct = correct_assignments(p_reference, class_mat)
-            # caclulate weight adjustments
-            deltas = calculate_deltas(X, p_reference, p_correct, class_mat,
-                                      self.coef_, self.reg, self.sigma, distance)
-            # for l in range(X.shape[1]):
-            #     # values for feature l starting with sample 0 to N
-            #     feature_vec = X[:, l].reshape(-1, 1)
-            #     # distance in feature l for all samples, d_ij
-            #     # d_mat = np.pdist(feature_vec, )
-            #     # d_mat = distance_matrix(feature_vec, np.array([1]), distance)
-            #     d_mat = spatial.distance.pdist(feature_vec, metric=self.metric)
-            #     d_mat = spatial.distance.squareform(d_mat)
-            #     # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
-            #     d_mat *= p_reference
-            #     # calculate p_i * sum(D_ij), j from 0 to N
-            #     all_term = p_correct * d_mat.sum(axis=0)
-            #     # weighted in-class distances using adjacency matrix,
-            #     in_class_term = np.sum(d_mat*class_mat, axis=0)
-            #     sample_terms = all_term - in_class_term
-            #     # calculate delta following gradient ascent 
-            #     deltas[l] = 2 * self.coef_[l] \
-            #                 * ((1 / self.sigma) * sample_terms.sum() - self.reg)
-            # # calculate objective function
-            new_objective = (np.sum(p_reference * class_mat) \
-                          - self.reg * np.dot(self.coef_, self.coef_))
+            deltas, score = weight_adjustments(X, class_matrix, self.coef_,
+                                               self.sigma, self.reg, distance)
             # calculate loss from previous objective function
-            print(new_objective, past_objective)
-            loss = new_objective - past_objective
+            print(score, past_score)
+            loss = score - past_score
             # update weights
             self.coef_ = self.coef_ + step_size * deltas
             # reset objective score for new iteration
-            past_objective = new_objective
+            past_score = score
             if loss > 0:
                 step_size *= 1.01
             else:
                 step_size *= 0.4
-        self.score_ = past_objective
+        self.score_ = score
         return self
 
     def transform(self, X):
@@ -262,7 +236,8 @@ def correct_assignments(p_reference, class_matrix):
 
 
 @jit(nopython=True)
-def reference_probabilities(X, weights, sigma, distance):
+def weight_adjustments(X, class_matrix, feature_weights, sigma,
+                       reg, distance):
     """
     Calculate reference probability matrix.
     
@@ -270,7 +245,7 @@ def reference_probabilities(X, weights, sigma, distance):
     ----------
     X : [type]
         [description]
-    weights : [type]
+    feature_weights : [type]
         [description]
     sigma : [type]
         [description]
@@ -282,8 +257,10 @@ def reference_probabilities(X, weights, sigma, distance):
     [type]
         [description]
     """
+    deltas = np.zeros(X.shape[1])
+    sample_weights = np.ones(X.shape[0])
     # calculate D_w(x_i, x_j): w^2 * |x_i - x_j] for all i,j
-    distances = distance_matrix(X, weights, distance)
+    distances = distance_matrix(X, feature_weights, distance)
     # calculate K(D_w(x_i, x_j)) for all i, j pairs
     p_reference = np.exp(-1 * distances / sigma)
     # set p_ii = 0, can't select self in leave-one-out
@@ -299,10 +276,30 @@ def reference_probabilities(X, weights, sigma, distance):
             pseudocount = np.min(scale_factors)
         scale_factors += pseudocount
     scale_factors = 1 / scale_factors
-    return p_reference * scale_factors
+    p_reference = p_reference * scale_factors
+    p_correct = np.sum(p_reference * class_matrix, axis=0)
+    # caclulate weight adjustments
+    for l in range(X.shape[1]):
+        # values for feature l starting with sample 0 to N
+        feature_vec = np.expand_dims(X[:, l], 1)
+        # distance in feature l for all samples, d_ij
+        d_mat = distance_matrix(feature_vec, sample_weights, distance)
+        # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
+        d_mat = d_mat * p_reference
+        # calculate p_i * sum(D_ij), j from 0 to N
+        all_term = p_correct * d_mat.sum(axis=0)
+        # weighted in-class distances using adjacency matrix,
+        in_class_term = np.sum(d_mat*class_matrix, axis=0)
+        sample_terms = all_term - in_class_term
+        # calculate delta following gradient ascent 
+        deltas[l] = 2 * feature_weights[l] \
+                  * ((1 / sigma) * sample_terms.sum() - reg)
+    score = (np.sum(p_reference * class_matrix) \
+          - reg * np.dot(feature_weights, feature_weights))
+    return deltas, score
 
 
-@jit(parallel=True)
+@jit()
 def calculate_deltas(X, p_reference, p_correct, class_matrix, weights, reg,
                      sigma, distance):
     deltas = np.zeros(X.shape[1])
