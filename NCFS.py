@@ -128,70 +128,9 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
             raise ValueError('Unsupported distance metric: {}'.\
                               format(self.metric))
         X= NCFS.__check_X(X)
-        n_samples, n_features = X.shape
-        # initialize all weights as 1
-        self.coef_ = np.ones(n_features, dtype=np.float64)
-        # instantiate feature deltas to zero
-        deltas = np.zeros(n_features, dtype=np.float64)
-        # get initial step size
-        step_size = self.alpha 
-        # construct adjacency matrix of class membership for matrix mult. 
-        class_matrix = np.zeros((n_samples, n_samples), np.float64)
-        for i in range(n_samples):
-            for j in range(n_samples):
-                if y[i] == y[j]:
-                    class_matrix[i, j] = 1
+        self.coef_, self.score_ = numba_fit(X, y, self.sigma, self.reg,
+                                            self.alpha, self.eta, distance)
 
-        past_score, loss = 0, np.inf
-        while abs(loss) > self.eta:
-            sample_weights = np.ones(X.shape[0])
-            # calculate K(D_w(x_i, x_j)) for all i, j pairs
-            p_reference = distance_matrix(X, self.coef_, self.sigma, distance,
-                                          base_kernel)
-            # add pseudocount if necessary to avoid dividing by zero
-            scale_factors = p_reference.sum(axis=0)
-            n_zeros = (scale_factors == 0).sum()
-            if n_zeros > 0:
-                if n_zeros == scale_factors.shape[0]:
-                    pseudocount = np.exp(-20)
-                else:
-                    pseudocount = np.min(scale_factors)
-                scale_factors += pseudocount
-            scale_factors = 1 / scale_factors
-            p_reference = p_reference * scale_factors
-            p_correct = np.sum(p_reference * class_matrix, axis=0)
-            # caclulate weight adjustments
-            for l in range(X.shape[1]):
-                # values for feature l starting with sample 0 to N
-                feature_vec = X[:, l].reshape(-1, 1)
-                # distance in feature l for all samples, d_ij
-                d_mat = distance_matrix(feature_vec, sample_weights, self.sigma,
-                                        distance, identity_kernel)
-                # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
-                d_mat = d_mat * p_reference
-                # calculate p_i * sum(D_ij), j from 0 to N
-                all_term = p_correct * d_mat.sum(axis=0)
-                # weighted in-class distances using adjacency matrix,
-                in_class_term = np.sum(d_mat*class_matrix, axis=0)
-                sample_terms = all_term - in_class_term
-                # calculate delta following gradient ascent 
-                deltas[l] = 2 * self.coef_[l] \
-                          * ((1 / self.sigma) * sample_terms.sum() - self.reg)
-            score = np.sum(p_reference * class_matrix) \
-                  - self.reg * np.dot(self.coef_, self.coef_)
-            # calculate loss from previous objective function
-            print(score, past_score)
-            loss = score - past_score
-            # update weights
-            self.coef_ = self.coef_ + step_size * deltas
-            # reset objective score for new iteration
-            past_score = score
-            if loss > 0:
-                step_size *= 1.01
-            else:
-                step_size *= 0.4
-        self.score_ = score
-        return self
 
     def transform(self, X):
         """
@@ -227,6 +166,83 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
                              'number of features as learnt feature weights.')
         NCFS.__check_X(X)
         return X*self.coef_
+
+@jit(nopython=True, parallel=True)
+def numba_fit(X, y, sigma, reg, alpha, eta, distance):
+    n_samples, n_features = X.shape
+    # initialize all weights as 1
+    feature_weights = np.ones(n_features, dtype=np.float64)
+    # instantiate feature deltas to zero
+    deltas = np.zeros(n_features, dtype=np.float64)
+    # get initial step size
+    step_size = alpha 
+    # construct adjacency matrix of class membership for matrix mult. 
+    class_matrix = np.zeros((n_samples, n_samples), dtype=np.float64)
+    # distance matrix of features between samples
+    feature_distance = np.zeros((n_samples, n_samples), dtype=np.float64)
+    p_reference = np.zeros((n_samples, n_samples), dtype=np.float64)
+    sample1_feature = np.zeros((1,1))
+    sample2_feature = np.zeros((1,1))
+    sample_weight = np.ones((1,1))
+    for i in range(n_samples):
+        for j in range(n_samples):
+            if y[i] == y[j]:
+                class_matrix[i, j] = 1
+
+    score, loss = 0, np.inf
+    iters = 0
+    while np.abs(loss) > eta:
+        # calculate K(D_w(x_i, x_j)) for all i, j pairs
+        # p_reference = distance_matrix(X, feature_weights, sigma, distance,
+        #                               base_kernel)
+        for i in range(n_samples):
+            for j in range(n_samples):
+                p_reference[i, j] = distance(X[i, :], X[j, :], feature_weights)
+                p_reference[i, j] = np.exp(-p_reference[i, j] / sigma)
+        # add pseudocount if necessary to avoid dividing by zero
+        scale_factors = p_reference.sum(axis=0)
+        n_zeros = (scale_factors == 0).sum()
+        if n_zeros > 0:
+            if n_zeros == scale_factors.shape[0]:
+                pseudocount = np.exp(-20)
+            else:
+                pseudocount = np.min(scale_factors[scale_factors != 0])
+            scale_factors += pseudocount
+        scale_factors = 1 / scale_factors
+        p_reference = p_reference * scale_factors
+        p_correct = np.sum(p_reference * class_matrix, axis=0)
+        # caclulate weight adjustments
+        for l in range(n_features):
+            # distance in feature l for all samples, d_ij
+            # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
+            for i in range(n_samples):
+                for j in range(n_samples):
+                    feature_distance[i, j] = np.abs(X[i, l] - X[j, l]) \
+                                           * p_reference[i, j]
+            # calculate p_i * sum(D_ij), j from 0 to N
+            all_term = p_correct * feature_distance.sum(axis=0)
+            # weighted in-class distances using adjacency matrix,
+            in_class_term = np.sum(feature_distance*class_matrix, axis=0)
+            sample_terms = all_term - in_class_term
+            # calculate delta following gradient ascent 
+            deltas[l] = 2 * feature_weights[l]\
+                      * ((1 / sigma) * sample_terms.sum() - reg)
+        new_score = np.sum(p_reference * class_matrix) \
+                  - reg * np.dot(feature_weights, feature_weights)
+        # calculate loss from previous objective function
+        print(new_score, score)
+        loss = new_score - score
+        # update weights
+        feature_weights = feature_weights + step_size * deltas
+        # reset objective score for new iteration
+        score = new_score
+        if loss > 0:
+            step_size *= 1.01
+        else:
+            step_size *= 0.4
+        iters += 1
+    print(iters)
+    return feature_weights, score
 
 @jit('f8(f8, f8)', nopython=True)
 def base_kernel(value, sigma):
