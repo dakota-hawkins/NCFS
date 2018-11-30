@@ -148,11 +148,9 @@ class NCFS(base.BaseEstimator, base.TransformerMixin):
             p_reference = reference_probabilities(X, self.coef_, self.sigma,
                                                   distance)
             # calculate probability of correct classification
-            p_correct = p_reference * class_matrix
+            p_correct = np.sum(p_reference * class_matrix, axis=0)
             # caclulate weight adjustments
             for l in range(X.shape[1]):
-                # values for feature l starting with sample 0 to N
-                # feature_vec = X[:, l].reshape(-1, 1)
                 # distance in feature l for all samples, d_ij
                 d_mat = spatial.distance.pdist(X[:, l].reshape(-1, 1),
                                                metric=self.metric)
@@ -284,11 +282,8 @@ def reference_probabilities(X, weights, sigma, distance):
         else:
             pseudocount = np.min(scale_factors[scale_factors != 0])
         scale_factors += pseudocount
-    for i in range(p_reference.shape[0]):
-        # denom = scale_factors[i]
-        for j in range(p_reference.shape[1]):
-            p_reference[i, j] = p_reference[i, j] / scale_factors[j]
-    return p_reference
+    scale_factors = 1 / scale_factors
+    return p_reference * scale_factors
 
 def toy_dataset(n_features=1000):
     """
