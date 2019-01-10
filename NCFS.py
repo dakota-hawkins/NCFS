@@ -217,8 +217,11 @@ def numba_fit(X, y, sigma, reg, alpha, eta, distance):
             # weighted distance matrix D_ij = d_ij * p_ij, p_ii = 0
             for i in range(n_samples):
                 for j in range(n_samples):
-                    feature_distance[i, j] = np.abs(X[i, l] - X[j, l]) \
-                                           * p_reference[i, j]
+                    if i == j:
+                        feature_distance[i, j] = 0
+                    else:
+                        feature_distance[i, j] = np.abs(X[i, l] - X[j, l]) \
+                                            * p_reference[i, j]
             # calculate p_i * sum(D_ij), j from 0 to N
             all_term = p_correct * feature_distance.sum(axis=0)
             # weighted in-class distances using adjacency matrix,
