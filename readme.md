@@ -1,3 +1,7 @@
+# Warning
+
+This package is currently out-of-date, and is no longer maintained. For an updated package that is faster and `pip` installable, go [here.](https://github.com/BradhamLab/ncfs)
+
 # Neigbhorhood Component Feature Selection
 
 This is a Python implementation of Neighborhood Component Feature Selection,
